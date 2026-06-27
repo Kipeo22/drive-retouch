@@ -25,6 +25,24 @@ type ImageRect = {
   height: number;
 };
 
+type FilterValues = {
+  whiteBalanceMatrix: string;
+  linearTone: {
+    slope: number;
+    intercept: number;
+  };
+  curveTone: {
+    amplitude: number;
+    exponent: number;
+    offset: number;
+  };
+  saturation: number;
+  detail: {
+    amount: number;
+    radius: number;
+  };
+};
+
 const defaultAdjustments: Adjustments = {
   temperature: 0,
   tint: 0,
@@ -41,14 +59,7 @@ const defaultAdjustments: Adjustments = {
   saturation: 0,
 };
 
-type Profile = "camera-natural" | "camera-vivid" | "portrait" | "landscape";
-
-const profileLabels: Record<Profile, string> = {
-  "camera-natural": "カメラ ナチュラル",
-  "camera-vivid": "カメラ ビビッド",
-  portrait: "ポートレート",
-  landscape: "風景",
-};
+const filterId = "drive-retouch-filter";
 
 export default defineContentScript({
   matches: ["https://drive.google.com/*"],
@@ -110,53 +121,102 @@ function getImageRect(img: HTMLImageElement): ImageRect {
   };
 }
 
-function buildFilter(
-  a: Adjustments,
-  profile: Profile,
-  monochrome: boolean,
-  hdr: boolean,
-): string {
-  const profileBoost =
-    profile === "camera-vivid"
-      ? { brightness: 1.01, contrast: 1.08, saturation: 1.14 }
-      : profile === "portrait"
-        ? { brightness: 1.03, contrast: 0.96, saturation: 1.04 }
-        : profile === "landscape"
-          ? { brightness: 1, contrast: 1.1, saturation: 1.16 }
-          : { brightness: 1, contrast: 1, saturation: 1 };
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max);
+}
 
-  // CSS filterでの非破壊プレビューなので、Lightroom相当の各補正は近似する。
-  const brightness =
-    profileBoost.brightness *
-    (1 +
-      a.exposure / 120 +
-      a.shadows / 450 +
-      a.whites / 650 -
-      a.blacks / 650 -
-      Math.max(a.highlights, 0) / 900 +
-      (hdr ? 0.03 : 0));
-  const contrast =
-    profileBoost.contrast *
-    (1 +
-      a.contrast / 140 +
-      a.clarity / 260 +
-      a.texture / 360 +
-      a.dehaze / 260 +
-      (hdr ? 0.12 : 0));
-  const saturation =
-    profileBoost.saturation *
-    (1 + a.saturation / 120 + a.vibrance / 180 + (hdr ? 0.05 : 0));
-  const sepia = Math.max(a.temperature, 0) / 180;
-  const hueRotate = a.tint * 0.18 + Math.min(a.temperature, 0) * 0.08;
+function round(value: number): number {
+  return Number(value.toFixed(4));
+}
 
-  return [
-    `brightness(${brightness})`,
-    `contrast(${contrast})`,
-    `saturate(${saturation})`,
-    `sepia(${sepia})`,
-    `hue-rotate(${hueRotate}deg)`,
-    `grayscale(${monochrome ? 1 : 0})`,
-  ].join(" ");
+function buildFilterValues(a: Adjustments): FilterValues {
+  const temperature = a.temperature / 100;
+  const tint = a.tint / 100;
+  const exposure = a.exposure / 100;
+  const contrast = a.contrast / 100;
+
+  const redScale = clamp(1 + temperature * 0.32 + tint * 0.06, 0.55, 1.55);
+  const greenScale = clamp(
+    1 - Math.abs(temperature) * 0.04 - tint * 0.22,
+    0.55,
+    1.5,
+  );
+  const blueScale = clamp(1 - temperature * 0.4 + tint * 0.08, 0.5, 1.65);
+
+  const contrastSlope = 1 + contrast * 0.72 + a.dehaze / 360;
+  const exposureSlope = Math.pow(2, exposure);
+  const linearSlope = clamp(
+    exposureSlope * contrastSlope * (1 + a.whites / 320),
+    0.16,
+    3.4,
+  );
+  const linearIntercept = clamp(
+    0.5 * (1 - contrastSlope) + a.blacks / 420 + a.shadows / 900,
+    -0.65,
+    0.65,
+  );
+
+  const curveExponent = clamp(
+    1 - a.shadows / 240 + Math.max(-a.highlights, 0) / 280,
+    0.35,
+    2.8,
+  );
+  const curveAmplitude = clamp(
+    1 + a.highlights / 260 + a.whites / 650,
+    0.32,
+    2.1,
+  );
+  const curveOffset = clamp(a.blacks / 700, -0.28, 0.28);
+
+  const saturation = clamp(
+    1 + a.saturation / 120 + a.vibrance / 260 + a.dehaze / 480,
+    0,
+    2.4,
+  );
+  const detailAmount = clamp(
+    (a.texture * 0.34 + a.clarity * 0.56 + a.dehaze * 0.28) / 100,
+    -0.45,
+    0.8,
+  );
+
+  return {
+    whiteBalanceMatrix: [
+      round(redScale),
+      0,
+      0,
+      0,
+      0,
+      0,
+      round(greenScale),
+      0,
+      0,
+      0,
+      0,
+      0,
+      round(blueScale),
+      0,
+      0,
+      0,
+      0,
+      0,
+      1,
+      0,
+    ].join(" "),
+    linearTone: {
+      slope: round(linearSlope),
+      intercept: round(linearIntercept),
+    },
+    curveTone: {
+      amplitude: round(curveAmplitude),
+      exponent: round(curveExponent),
+      offset: round(curveOffset),
+    },
+    saturation: round(saturation),
+    detail: {
+      amount: round(detailAmount),
+      radius: detailAmount >= 0 ? 0.8 : 1.8,
+    },
+  };
 }
 
 function RetouchApp() {
@@ -165,15 +225,12 @@ function RetouchApp() {
   const [imageRect, setImageRect] = useState<ImageRect | null>(null);
   const [panelOpen, setPanelOpen] = useState(false);
   const [beforeAfter, setBeforeAfter] = useState(100);
-  const [profile, setProfile] = useState<Profile>("camera-natural");
-  const [monochrome, setMonochrome] = useState(false);
-  const [hdr, setHdr] = useState(false);
   const [adjustments, setAdjustments] =
     useState<Adjustments>(defaultAdjustments);
 
-  const filter = useMemo(
-    () => buildFilter(adjustments, profile, monochrome, hdr),
-    [adjustments, hdr, monochrome, profile],
+  const filterValues = useMemo(
+    () => buildFilterValues(adjustments),
+    [adjustments],
   );
 
   useEffect(() => {
@@ -244,6 +301,8 @@ function RetouchApp() {
 
       {panelOpen && (
         <>
+          <RetouchFilter values={filterValues} />
+
           <div
             className="dr-after-layer"
             style={{
@@ -265,7 +324,7 @@ function RetouchApp() {
                 style={{
                   width: imageRect.width,
                   height: imageRect.height,
-                  filter,
+                  filter: `url(#${filterId})`,
                 }}
               />
             </div>
@@ -291,63 +350,12 @@ function RetouchApp() {
                   setPanelOpen(false);
                   setAdjustments(defaultAdjustments);
                   setBeforeAfter(100);
-                  setProfile("camera-natural");
-                  setMonochrome(false);
-                  setHdr(false);
                 }}
               >
                 ×
               </button>
             </header>
 
-            <div className="dr-quick-actions">
-              <button
-                onClick={() =>
-                  setAdjustments({
-                    ...defaultAdjustments,
-                    exposure: 8,
-                    contrast: 10,
-                    highlights: -18,
-                    shadows: 24,
-                    whites: 8,
-                    blacks: -8,
-                    vibrance: 12,
-                  })
-                }
-              >
-                自動補正
-              </button>
-              <button
-                className={monochrome ? "dr-active" : undefined}
-                onClick={() => setMonochrome((value) => !value)}
-              >
-                白黒
-              </button>
-              <button
-                className={hdr ? "dr-active" : undefined}
-                onClick={() => setHdr((value) => !value)}
-              >
-                HDR
-              </button>
-            </div>
-
-            <label className="dr-select-row">
-              <span>プロファイル</span>
-              <select
-                value={profile}
-                onChange={(e) => setProfile(e.target.value as Profile)}
-              >
-                {Object.entries(profileLabels).map(([value, label]) => (
-                  <option key={value} value={value}>
-                    {label}
-                  </option>
-                ))}
-              </select>
-            </label>
-
-            <div className="dr-divider-horizontal" />
-
-            <div className="dr-section-title">WB: 撮影時</div>
             <Slider
               label="色温度"
               min={-100}
@@ -476,9 +484,6 @@ function RetouchApp() {
               onClick={() => {
                 setAdjustments(defaultAdjustments);
                 setBeforeAfter(100);
-                setProfile("camera-natural");
-                setMonochrome(false);
-                setHdr(false);
               }}
             >
               リセット
@@ -487,6 +492,83 @@ function RetouchApp() {
         </>
       )}
     </>
+  );
+}
+
+function RetouchFilter({ values }: { values: FilterValues }) {
+  return (
+    <svg className="dr-filter-defs" aria-hidden="true" focusable="false">
+      <filter
+        id={filterId}
+        x="-12%"
+        y="-12%"
+        width="124%"
+        height="124%"
+        colorInterpolationFilters="sRGB"
+      >
+        <feColorMatrix
+          in="SourceGraphic"
+          type="matrix"
+          values={values.whiteBalanceMatrix}
+          result="whiteBalanced"
+        />
+        <feComponentTransfer in="whiteBalanced" result="linearTone">
+          <feFuncR
+            type="linear"
+            slope={values.linearTone.slope}
+            intercept={values.linearTone.intercept}
+          />
+          <feFuncG
+            type="linear"
+            slope={values.linearTone.slope}
+            intercept={values.linearTone.intercept}
+          />
+          <feFuncB
+            type="linear"
+            slope={values.linearTone.slope}
+            intercept={values.linearTone.intercept}
+          />
+        </feComponentTransfer>
+        <feComponentTransfer in="linearTone" result="curveTone">
+          <feFuncR
+            type="gamma"
+            amplitude={values.curveTone.amplitude}
+            exponent={values.curveTone.exponent}
+            offset={values.curveTone.offset}
+          />
+          <feFuncG
+            type="gamma"
+            amplitude={values.curveTone.amplitude}
+            exponent={values.curveTone.exponent}
+            offset={values.curveTone.offset}
+          />
+          <feFuncB
+            type="gamma"
+            amplitude={values.curveTone.amplitude}
+            exponent={values.curveTone.exponent}
+            offset={values.curveTone.offset}
+          />
+        </feComponentTransfer>
+        <feColorMatrix
+          in="curveTone"
+          type="saturate"
+          values={`${values.saturation}`}
+          result="colorTone"
+        />
+        <feGaussianBlur
+          in="colorTone"
+          stdDeviation={values.detail.radius}
+          result="softDetail"
+        />
+        <feComposite
+          in="colorTone"
+          in2="softDetail"
+          operator="arithmetic"
+          k2={1 + values.detail.amount}
+          k3={-values.detail.amount}
+        />
+      </filter>
+    </svg>
   );
 }
 

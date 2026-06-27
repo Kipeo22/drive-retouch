@@ -49,6 +49,14 @@
   box-shadow: 0 0 12px rgba(0, 0, 0, 0.75);
 }
 
+.dr-filter-defs {
+  position: fixed;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
 .dr-control-panel {
   position: fixed;
   right: 24px;
@@ -95,49 +103,6 @@
   font-size: 18px;
   line-height: 1;
   cursor: pointer;
-}
-
-.dr-quick-actions {
-  display: grid;
-  grid-template-columns: 1fr 0.8fr 0.8fr;
-  gap: 8px;
-  margin-bottom: 14px;
-}
-
-.dr-quick-actions button {
-  min-height: 34px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 999px;
-  background: #3a3a3a;
-  color: #f3f3f3;
-  font-size: 13px;
-  font-weight: 700;
-  cursor: pointer;
-}
-
-.dr-quick-actions button.dr-active {
-  background: #eeeeee;
-  color: #111111;
-}
-
-.dr-select-row {
-  display: grid;
-  grid-template-columns: 86px 1fr;
-  align-items: center;
-  gap: 12px;
-  margin-bottom: 14px;
-  font-size: 13px;
-  color: #dddddd;
-}
-
-.dr-select-row select {
-  min-width: 0;
-  height: 32px;
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  border-radius: 8px;
-  background: #343434;
-  color: #f5f5f5;
-  padding: 0 10px;
 }
 
 .dr-section-title {
@@ -194,7 +159,6 @@
 
 .dr-reset:hover,
 .dr-close:hover,
-.dr-floating-button:hover,
-.dr-quick-actions button:hover {
+.dr-floating-button:hover {
   opacity: 0.86;
 }
