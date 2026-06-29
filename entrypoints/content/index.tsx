@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./content.css";
 
@@ -23,6 +23,17 @@ type ImageRect = {
   top: number;
   width: number;
   height: number;
+};
+
+type RetouchButtonPosition = {
+  left: number;
+  top: number;
+};
+
+type HiddenDriveControl = {
+  element: HTMLElement;
+  visibility: string;
+  pointerEvents: string;
 };
 
 type FilterValues = {
@@ -60,15 +71,17 @@ const defaultAdjustments: Adjustments = {
 };
 
 const filterId = "drive-retouch-filter";
+const rootId = "drive-retouch-root";
+const retouchButtonWidth = 112;
 
 export default defineContentScript({
   matches: ["https://drive.google.com/*"],
   main() {
-    const existingRoot = document.getElementById("drive-retouch-root");
+    const existingRoot = document.getElementById(rootId);
     if (existingRoot) return;
 
     const root = document.createElement("div");
-    root.id = "drive-retouch-root";
+    root.id = rootId;
     document.documentElement.appendChild(root);
 
     createRoot(root).render(<RetouchApp />);
@@ -90,6 +103,10 @@ function findLargestVisibleImage(): HTMLImageElement | null {
       };
     })
     .filter(({ img, rect, area }) => {
+      if (img.closest(`#${rootId}`)) {
+        return false;
+      }
+
       const style = window.getComputedStyle(img);
 
       return (
@@ -121,12 +138,157 @@ function getImageRect(img: HTMLImageElement): ImageRect {
   };
 }
 
+function getRetouchButtonPosition(): RetouchButtonPosition | null {
+  const openWithLabels = ["アプリで開く", "Open with"];
+  const candidates = Array.from(
+    document.querySelectorAll<HTMLElement>("[aria-label]"),
+  )
+    .map((element) => {
+      const rect = element.getBoundingClientRect();
+      const label = element.getAttribute("aria-label") ?? "";
+
+      return {
+        element,
+        label,
+        rect,
+      };
+    })
+    .filter(({ element, label, rect }) => {
+      if (element.closest(`#${rootId}`)) {
+        return false;
+      }
+
+      const style = window.getComputedStyle(element);
+
+      return (
+        openWithLabels.some((value) => label.includes(value)) &&
+        rect.width >= 96 &&
+        rect.height >= 28 &&
+        rect.top >= 0 &&
+        rect.top < 72 &&
+        rect.left > window.innerWidth * 0.45 &&
+        rect.right <= window.innerWidth &&
+        style.display !== "none" &&
+        style.visibility !== "hidden"
+      );
+    })
+    .sort((a, b) => a.rect.top - b.rect.top || b.rect.right - a.rect.right);
+
+  const anchor = candidates[0];
+
+  if (!anchor) {
+    return null;
+  }
+
+  return {
+    left: Math.max(12, anchor.rect.left - retouchButtonWidth - 12),
+    top: Math.max(8, anchor.rect.top + (anchor.rect.height - 32) / 2),
+  };
+}
+
+function getControlLabel(element: HTMLElement): string {
+  return [
+    element.getAttribute("aria-label"),
+    element.getAttribute("title"),
+    element.getAttribute("data-tooltip"),
+    element.getAttribute("data-tooltip-text"),
+    element.textContent,
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isDriveZoomControl(element: HTMLElement): boolean {
+  if (element.closest(`#${rootId}`)) {
+    return false;
+  }
+
+  const rect = element.getBoundingClientRect();
+  const style = window.getComputedStyle(element);
+
+  if (
+    rect.width <= 0 ||
+    rect.height <= 0 ||
+    rect.top < 0 ||
+    rect.top > 160 ||
+    rect.left < 0 ||
+    rect.right > window.innerWidth ||
+    style.display === "none" ||
+    style.visibility === "hidden"
+  ) {
+    return false;
+  }
+
+  const label = getControlLabel(element).toLowerCase();
+  const matchesZoomLabel =
+    label.includes("zoom in") ||
+    label.includes("zoom out") ||
+    label.includes("ズームイン") ||
+    label.includes("ズームアウト") ||
+    label.includes("拡大") ||
+    label.includes("縮小");
+
+  if (matchesZoomLabel) {
+    return true;
+  }
+
+  const compactText = (element.textContent ?? "").trim();
+
+  return rect.width <= 64 && ["+", "-", "−"].includes(compactText);
+}
+
+function hideDriveZoomControls(): HiddenDriveControl[] {
+  const controls = Array.from(
+    document.querySelectorAll<HTMLElement>(
+      'button, [role="button"], [aria-label], [title], [data-tooltip], [data-tooltip-text]',
+    ),
+  ).filter(isDriveZoomControl);
+
+  return controls.map((element) => {
+    const previous = {
+      element,
+      visibility: element.style.visibility,
+      pointerEvents: element.style.pointerEvents,
+    };
+
+    element.style.visibility = "hidden";
+    element.style.pointerEvents = "none";
+
+    return previous;
+  });
+}
+
+function restoreHiddenDriveControls(hiddenControls: HiddenDriveControl[]) {
+  hiddenControls.forEach(({ element, visibility, pointerEvents }) => {
+    element.style.visibility = visibility;
+    element.style.pointerEvents = pointerEvents;
+  });
+}
+
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
 }
 
 function round(value: number): number {
   return Number(value.toFixed(4));
+}
+
+function hasRectChanged(
+  current: ImageRect | null,
+  next: ImageRect | null,
+): boolean {
+  if (!current || !next) return current !== next;
+
+  const threshold = 0.25;
+
+  return (
+    Math.abs(current.left - next.left) > threshold ||
+    Math.abs(current.top - next.top) > threshold ||
+    Math.abs(current.width - next.width) > threshold ||
+    Math.abs(current.height - next.height) > threshold
+  );
 }
 
 function buildFilterValues(a: Adjustments): FilterValues {
@@ -223,59 +385,217 @@ function RetouchApp() {
   const [targetImage, setTargetImage] = useState<HTMLImageElement | null>(null);
   const [imageSrc, setImageSrc] = useState<string | null>(null);
   const [imageRect, setImageRect] = useState<ImageRect | null>(null);
+  const [retouchButtonPosition, setRetouchButtonPosition] =
+    useState<RetouchButtonPosition | null>(null);
   const [panelOpen, setPanelOpen] = useState(false);
+  const [retouchZoom, setRetouchZoom] = useState(1);
   const [beforeAfter, setBeforeAfter] = useState(100);
   const [adjustments, setAdjustments] =
     useState<Adjustments>(defaultAdjustments);
+  const targetImageRef = useRef<HTMLImageElement | null>(null);
+  const imageSrcRef = useRef<string | null>(null);
+  const imageRectRef = useRef<ImageRect | null>(null);
+  const panelOpenRef = useRef(panelOpen);
+  const missingTargetSinceRef = useRef<number | null>(null);
+  const scheduledFrameRef = useRef<number | null>(null);
 
   const filterValues = useMemo(
     () => buildFilterValues(adjustments),
     [adjustments],
   );
+  const retouchRect = useMemo(() => {
+    if (!imageRect) return null;
+
+    const width = imageRect.width * retouchZoom;
+    const height = imageRect.height * retouchZoom;
+
+    return {
+      left: imageRect.left + (imageRect.width - width) / 2,
+      top: imageRect.top + (imageRect.height - height) / 2,
+      width,
+      height,
+    };
+  }, [imageRect, retouchZoom]);
 
   useEffect(() => {
-    const updateTargetImage = () => {
-      const img = findLargestVisibleImage();
+    panelOpenRef.current = panelOpen;
+  }, [panelOpen]);
 
+  const publishTarget = useCallback(
+    (
+      img: HTMLImageElement | null,
+      src: string | null,
+      rect: ImageRect | null,
+    ) => {
+      if (
+        targetImageRef.current === img &&
+        imageSrcRef.current === src &&
+        !hasRectChanged(imageRectRef.current, rect)
+      ) {
+        return;
+      }
+
+      targetImageRef.current = img;
+      imageSrcRef.current = src;
+      imageRectRef.current = rect;
       setTargetImage(img);
-      setImageSrc(img?.currentSrc ?? null);
-      setImageRect(img ? getImageRect(img) : null);
-    };
+      setImageSrc(src);
+      setImageRect(rect);
+    },
+    [],
+  );
 
+  const updateTargetImage = useCallback(() => {
+    const img = findLargestVisibleImage();
+
+    if (!img) {
+      if (imageSrcRef.current && imageRectRef.current) {
+        const now = performance.now();
+        missingTargetSinceRef.current ??= now;
+
+        if (
+          getRetouchButtonPosition() ||
+          now - missingTargetSinceRef.current < 1_000
+        ) {
+          return;
+        }
+
+        setPanelOpen(false);
+      }
+
+      missingTargetSinceRef.current = null;
+      publishTarget(null, null, null);
+      return;
+    }
+
+    missingTargetSinceRef.current = null;
+    publishTarget(img, img.currentSrc, getImageRect(img));
+  }, [publishTarget]);
+
+  const updateRetouchButtonPosition = useCallback(() => {
+    const nextPosition = getRetouchButtonPosition();
+
+    setRetouchButtonPosition((currentPosition) => {
+      if (
+        (!currentPosition && !nextPosition) ||
+        (currentPosition &&
+          nextPosition &&
+          Math.abs(currentPosition.left - nextPosition.left) <= 0.25 &&
+          Math.abs(currentPosition.top - nextPosition.top) <= 0.25)
+      ) {
+        return currentPosition;
+      }
+
+      return nextPosition;
+    });
+  }, []);
+
+  const scheduleTargetUpdate = useCallback(() => {
+    if (scheduledFrameRef.current !== null) return;
+
+    scheduledFrameRef.current = window.requestAnimationFrame(() => {
+      scheduledFrameRef.current = null;
+      updateTargetImage();
+      updateRetouchButtonPosition();
+    });
+  }, [updateTargetImage, updateRetouchButtonPosition]);
+
+  useEffect(() => {
     updateTargetImage();
+    updateRetouchButtonPosition();
 
-    const observer = new MutationObserver(updateTargetImage);
-    observer.observe(document.body, {
+    const observer = new MutationObserver(scheduleTargetUpdate);
+    observer.observe(document.body ?? document.documentElement, {
       childList: true,
       subtree: true,
       attributes: true,
       attributeFilter: ["src", "style", "class"],
     });
 
-    window.addEventListener("resize", updateTargetImage);
-    window.addEventListener("scroll", updateTargetImage, true);
+    window.addEventListener("resize", scheduleTargetUpdate);
+    window.addEventListener("scroll", scheduleTargetUpdate, true);
 
-    const intervalId = window.setInterval(updateTargetImage, 500);
+    const intervalId = window.setInterval(scheduleTargetUpdate, 500);
 
     return () => {
       observer.disconnect();
-      window.removeEventListener("resize", updateTargetImage);
-      window.removeEventListener("scroll", updateTargetImage, true);
+      window.removeEventListener("resize", scheduleTargetUpdate);
+      window.removeEventListener("scroll", scheduleTargetUpdate, true);
       window.clearInterval(intervalId);
+
+      if (scheduledFrameRef.current !== null) {
+        window.cancelAnimationFrame(scheduledFrameRef.current);
+      }
     };
-  }, []);
+  }, [scheduleTargetUpdate, updateTargetImage, updateRetouchButtonPosition]);
+
+  useEffect(() => {
+    if (!panelOpen) return;
+
+    let animationFrameId = 0;
+
+    const syncDuringPreviewChanges = () => {
+      updateTargetImage();
+      animationFrameId = window.requestAnimationFrame(syncDuringPreviewChanges);
+    };
+
+    animationFrameId = window.requestAnimationFrame(syncDuringPreviewChanges);
+
+    return () => {
+      window.cancelAnimationFrame(animationFrameId);
+    };
+  }, [panelOpen, updateTargetImage]);
+
+  useEffect(() => {
+    if (!panelOpen) return;
+
+    let hiddenControls: HiddenDriveControl[] = [];
+
+    const refreshHiddenControls = () => {
+      restoreHiddenDriveControls(hiddenControls);
+      hiddenControls = hideDriveZoomControls();
+    };
+
+    refreshHiddenControls();
+
+    const observer = new MutationObserver(refreshHiddenControls);
+    observer.observe(document.body ?? document.documentElement, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: [
+        "aria-label",
+        "title",
+        "data-tooltip",
+        "data-tooltip-text",
+        "class",
+      ],
+    });
+
+    return () => {
+      observer.disconnect();
+      restoreHiddenDriveControls(hiddenControls);
+    };
+  }, [panelOpen]);
 
   useEffect(() => {
     if (!targetImage) return;
 
-    // Google Drive側の元画像は加工しない。
-    // Beforeとして残して、その上にAfter画像を重ねる。
+    const previousFilter = targetImage.style.filter;
+    const previousOpacity = targetImage.style.opacity;
+
+    // Google Drive側の元画像は加工せず、パネル表示中だけ透明にする。
+    // Before/Afterは同じ固定レイヤー内に重ね、ズーム時のズレを抑える。
     targetImage.style.filter = "";
+    if (panelOpen) {
+      targetImage.style.opacity = "0";
+    }
 
     return () => {
-      targetImage.style.filter = "";
+      targetImage.style.filter = previousFilter;
+      targetImage.style.opacity = previousOpacity;
     };
-  }, [targetImage]);
+  }, [panelOpen, targetImage]);
 
   const updateAdjustment = (key: keyof Adjustments, value: number) => {
     setAdjustments((prev) => ({
@@ -283,35 +603,53 @@ function RetouchApp() {
       [key]: value,
     }));
   };
-
-  if (!imageSrc || !imageRect) {
-    return null;
-  }
+  const updateRetouchZoom = (nextZoom: number) => {
+    setRetouchZoom(clamp(round(nextZoom), 0.25, 4));
+  };
+  const hasImageTarget = Boolean(imageSrc && imageRect);
 
   return (
     <>
-      {!panelOpen && (
+      {hasImageTarget && !panelOpen && (
         <button
-          className="dr-floating-button"
+          className="dr-retouch-launcher"
+          style={
+            retouchButtonPosition
+              ? {
+                  left: retouchButtonPosition.left,
+                  top: retouchButtonPosition.top,
+                }
+              : undefined
+          }
+          title="Drive Retouchを開く"
           onClick={() => setPanelOpen(true)}
         >
           レタッチ
         </button>
       )}
 
-      {panelOpen && (
+      {panelOpen && imageSrc && retouchRect && (
         <>
           <RetouchFilter values={filterValues} />
 
           <div
             className="dr-after-layer"
             style={{
-              left: imageRect.left,
-              top: imageRect.top,
-              width: imageRect.width,
-              height: imageRect.height,
+              left: retouchRect.left,
+              top: retouchRect.top,
+              width: retouchRect.width,
+              height: retouchRect.height,
             }}
           >
+            <img
+              className="dr-before-image"
+              src={imageSrc}
+              style={{
+                width: retouchRect.width,
+                height: retouchRect.height,
+              }}
+            />
+
             <div
               className="dr-after-clip"
               style={{
@@ -322,8 +660,8 @@ function RetouchApp() {
                 className="dr-after-image"
                 src={imageSrc}
                 style={{
-                  width: imageRect.width,
-                  height: imageRect.height,
+                  width: retouchRect.width,
+                  height: retouchRect.height,
                   filter: `url(#${filterId})`,
                 }}
               />
@@ -350,6 +688,7 @@ function RetouchApp() {
                   setPanelOpen(false);
                   setAdjustments(defaultAdjustments);
                   setBeforeAfter(100);
+                  setRetouchZoom(1);
                 }}
               >
                 ×
@@ -384,6 +723,31 @@ function RetouchApp() {
               formatValue={(value) => `${value}%`}
               onChange={setBeforeAfter}
             />
+
+            <div className="dr-zoom-label">拡大縮小</div>
+            <div className="dr-zoom-controls" aria-label="レタッチ表示倍率">
+              <button
+                className="dr-zoom-button"
+                type="button"
+                onClick={() => updateRetouchZoom(retouchZoom - 0.25)}
+              >
+                −
+              </button>
+              <button
+                className="dr-zoom-value"
+                type="button"
+                onClick={() => updateRetouchZoom(1)}
+              >
+                {Math.round(retouchZoom * 100)}%
+              </button>
+              <button
+                className="dr-zoom-button"
+                type="button"
+                onClick={() => updateRetouchZoom(retouchZoom + 0.25)}
+              >
+                +
+              </button>
+            </div>
 
             <div className="dr-divider-horizontal" />
 
@@ -484,6 +848,7 @@ function RetouchApp() {
               onClick={() => {
                 setAdjustments(defaultAdjustments);
                 setBeforeAfter(100);
+                setRetouchZoom(1);
               }}
             >
               リセット
