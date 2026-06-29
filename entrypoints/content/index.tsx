@@ -38,15 +38,11 @@ type HiddenDriveControl = {
 
 type FilterValues = {
   whiteBalanceMatrix: string;
-  linearTone: {
+  exposureTone: {
     slope: number;
     intercept: number;
   };
-  curveTone: {
-    amplitude: number;
-    exponent: number;
-    offset: number;
-  };
+  toneCurve: string;
   saturation: number;
   detail: {
     amount: number;
@@ -73,6 +69,7 @@ const defaultAdjustments: Adjustments = {
 const filterId = "drive-retouch-filter";
 const rootId = "drive-retouch-root";
 const retouchButtonWidth = 112;
+const toneCurveSampleCount = 17;
 
 export default defineContentScript({
   matches: ["https://drive.google.com/*"],
@@ -275,6 +272,12 @@ function round(value: number): number {
   return Number(value.toFixed(4));
 }
 
+function smoothstep(edge0: number, edge1: number, value: number): number {
+  const x = clamp((value - edge0) / (edge1 - edge0), 0, 1);
+
+  return x * x * (3 - 2 * x);
+}
+
 function hasRectChanged(
   current: ImageRect | null,
   next: ImageRect | null,
@@ -305,30 +308,40 @@ function buildFilterValues(a: Adjustments): FilterValues {
   );
   const blueScale = clamp(1 - temperature * 0.4 + tint * 0.08, 0.5, 1.65);
 
-  const contrastSlope = 1 + contrast * 0.72 + a.dehaze / 360;
-  const exposureSlope = Math.pow(2, exposure);
-  const linearSlope = clamp(
-    exposureSlope * contrastSlope * (1 + a.whites / 320),
-    0.16,
-    3.4,
-  );
-  const linearIntercept = clamp(
-    0.5 * (1 - contrastSlope) + a.blacks / 420 + a.shadows / 900,
-    -0.65,
-    0.65,
-  );
+  const exposureSlope = clamp(Math.pow(2, exposure * 0.72), 0.42, 2.4);
+  const exposureIntercept = clamp((1 - exposureSlope) * 0.08, -0.08, 0.08);
+  const contrastAmount = contrast * 0.36 + a.dehaze / 520;
+  const shadowAmount = a.shadows / 100;
+  const highlightAmount = a.highlights / 100;
+  const whiteAmount = a.whites / 100;
+  const blackAmount = a.blacks / 100;
+  let previousTone = 0;
+  const toneCurve = Array.from({ length: toneCurveSampleCount }, (_, index) => {
+    const x = index / (toneCurveSampleCount - 1);
+    const contrastWeight = 1 - Math.abs(x - 0.5) * 0.34;
+    const shadowMask = 1 - smoothstep(0.08, 0.54, x);
+    const highlightMask = smoothstep(0.46, 0.94, x);
+    const blackMask = 1 - smoothstep(0, 0.28, x);
+    const whiteMask = smoothstep(0.72, 1, x);
+    let y = x;
 
-  const curveExponent = clamp(
-    1 - a.shadows / 240 + Math.max(-a.highlights, 0) / 280,
-    0.35,
-    2.8,
-  );
-  const curveAmplitude = clamp(
-    1 + a.highlights / 260 + a.whites / 650,
-    0.32,
-    2.1,
-  );
-  const curveOffset = clamp(a.blacks / 700, -0.28, 0.28);
+    y = 0.5 + (y - 0.5) * (1 + contrastAmount * contrastWeight);
+    y += shadowAmount * 0.18 * shadowMask * (1 - x * 0.45);
+    y += highlightAmount * 0.18 * highlightMask * (0.35 + (1 - x) * 0.65);
+    y += blackAmount * 0.12 * blackMask;
+    y += whiteAmount * 0.12 * whiteMask;
+
+    y = clamp(y, 0, 1);
+
+    if (index > 0) {
+      y = Math.max(y, previousTone + 0.002);
+    }
+
+    previousTone = clamp(y, 0, 1);
+
+    return round(previousTone);
+  })
+    .join(" ");
 
   const saturation = clamp(
     1 + a.saturation / 120 + a.vibrance / 260 + a.dehaze / 480,
@@ -364,21 +377,21 @@ function buildFilterValues(a: Adjustments): FilterValues {
       1,
       0,
     ].join(" "),
-    linearTone: {
-      slope: round(linearSlope),
-      intercept: round(linearIntercept),
+    exposureTone: {
+      slope: round(exposureSlope),
+      intercept: round(exposureIntercept),
     },
-    curveTone: {
-      amplitude: round(curveAmplitude),
-      exponent: round(curveExponent),
-      offset: round(curveOffset),
-    },
+    toneCurve,
     saturation: round(saturation),
     detail: {
       amount: round(detailAmount),
       radius: detailAmount >= 0 ? 0.8 : 1.8,
     },
   };
+}
+
+function hasActiveAdjustments(adjustments: Adjustments): boolean {
+  return Object.values(adjustments).some((value) => value !== 0);
 }
 
 function RetouchApp() {
@@ -402,6 +415,10 @@ function RetouchApp() {
     () => buildFilterValues(adjustments),
     [adjustments],
   );
+  const adjustmentsActive = useMemo(
+    () => hasActiveAdjustments(adjustments),
+    [adjustments],
+  );
   const retouchRect = useMemo(() => {
     if (!imageRect) return null;
 
@@ -415,6 +432,7 @@ function RetouchApp() {
       height,
     };
   }, [imageRect, retouchZoom]);
+  const retouchPreviewActive = adjustmentsActive || retouchZoom !== 1;
 
   useEffect(() => {
     panelOpenRef.current = panelOpen;
@@ -584,10 +602,10 @@ function RetouchApp() {
     const previousFilter = targetImage.style.filter;
     const previousOpacity = targetImage.style.opacity;
 
-    // Google Drive側の元画像は加工せず、パネル表示中だけ透明にする。
-    // Before/Afterは同じ固定レイヤー内に重ね、ズーム時のズレを抑える。
-    targetImage.style.filter = "";
-    if (panelOpen) {
+    if (panelOpen && retouchPreviewActive) {
+      // Google Drive側の元画像は加工せず、拡張側のプレビュー表示中だけ透明にする。
+      // Before/Afterは同じ固定レイヤー内に重ね、ズーム時のズレを抑える。
+      targetImage.style.filter = "";
       targetImage.style.opacity = "0";
     }
 
@@ -595,7 +613,7 @@ function RetouchApp() {
       targetImage.style.filter = previousFilter;
       targetImage.style.opacity = previousOpacity;
     };
-  }, [panelOpen, targetImage]);
+  }, [panelOpen, retouchPreviewActive, targetImage]);
 
   const updateAdjustment = (key: keyof Adjustments, value: number) => {
     setAdjustments((prev) => ({
@@ -627,50 +645,56 @@ function RetouchApp() {
 
       {panelOpen && imageSrc && retouchRect && (
         <>
-          <RetouchFilter values={filterValues} />
+          {retouchPreviewActive && (
+            <>
+              {adjustmentsActive && <RetouchFilter values={filterValues} />}
 
-          <div
-            className="dr-after-layer"
-            style={{
-              left: retouchRect.left,
-              top: retouchRect.top,
-              width: retouchRect.width,
-              height: retouchRect.height,
-            }}
-          >
-            <img
-              className="dr-before-image"
-              src={imageSrc}
-              style={{
-                width: retouchRect.width,
-                height: retouchRect.height,
-              }}
-            />
-
-            <div
-              className="dr-after-clip"
-              style={{
-                width: `${beforeAfter}%`,
-              }}
-            >
-              <img
-                className="dr-after-image"
-                src={imageSrc}
+              <div
+                className="dr-after-layer"
                 style={{
+                  left: retouchRect.left,
+                  top: retouchRect.top,
                   width: retouchRect.width,
                   height: retouchRect.height,
-                  filter: `url(#${filterId})`,
                 }}
-              />
-            </div>
+              >
+                <img
+                  className="dr-before-image"
+                  src={imageSrc}
+                  style={{
+                    width: retouchRect.width,
+                    height: retouchRect.height,
+                  }}
+                />
 
-            <div
-              className="dr-before-after-line"
-              style={{
-                left: `${beforeAfter}%`,
-              }}
-            />
-          </div>
+                <div
+                  className="dr-after-clip"
+                  style={{
+                    width: `${beforeAfter}%`,
+                  }}
+                >
+                  <img
+                    className="dr-after-image"
+                    src={imageSrc}
+                    style={{
+                      width: retouchRect.width,
+                      height: retouchRect.height,
+                      filter: adjustmentsActive
+                        ? `url(#${filterId})`
+                        : undefined,
+                    }}
+                  />
+                </div>
+
+                <div
+                  className="dr-before-after-line"
+                  style={{
+                    left: `${beforeAfter}%`,
+                  }}
+                />
+              </div>
+            </>
+          )}
 
           <aside className="dr-control-panel">
             <header className="dr-panel-header">
@@ -874,41 +898,35 @@ function RetouchFilter({ values }: { values: FilterValues }) {
           values={values.whiteBalanceMatrix}
           result="whiteBalanced"
         />
-        <feComponentTransfer in="whiteBalanced" result="linearTone">
+        <feComponentTransfer in="whiteBalanced" result="exposureTone">
           <feFuncR
             type="linear"
-            slope={values.linearTone.slope}
-            intercept={values.linearTone.intercept}
+            slope={values.exposureTone.slope}
+            intercept={values.exposureTone.intercept}
           />
           <feFuncG
             type="linear"
-            slope={values.linearTone.slope}
-            intercept={values.linearTone.intercept}
+            slope={values.exposureTone.slope}
+            intercept={values.exposureTone.intercept}
           />
           <feFuncB
             type="linear"
-            slope={values.linearTone.slope}
-            intercept={values.linearTone.intercept}
+            slope={values.exposureTone.slope}
+            intercept={values.exposureTone.intercept}
           />
         </feComponentTransfer>
-        <feComponentTransfer in="linearTone" result="curveTone">
+        <feComponentTransfer in="exposureTone" result="curveTone">
           <feFuncR
-            type="gamma"
-            amplitude={values.curveTone.amplitude}
-            exponent={values.curveTone.exponent}
-            offset={values.curveTone.offset}
+            type="table"
+            tableValues={values.toneCurve}
           />
           <feFuncG
-            type="gamma"
-            amplitude={values.curveTone.amplitude}
-            exponent={values.curveTone.exponent}
-            offset={values.curveTone.offset}
+            type="table"
+            tableValues={values.toneCurve}
           />
           <feFuncB
-            type="gamma"
-            amplitude={values.curveTone.amplitude}
-            exponent={values.curveTone.exponent}
-            offset={values.curveTone.offset}
+            type="table"
+            tableValues={values.toneCurve}
           />
         </feComponentTransfer>
         <feColorMatrix
