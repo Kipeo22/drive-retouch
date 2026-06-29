@@ -396,7 +396,6 @@ function RetouchApp() {
   const imageSrcRef = useRef<string | null>(null);
   const imageRectRef = useRef<ImageRect | null>(null);
   const panelOpenRef = useRef(panelOpen);
-  const missingTargetSinceRef = useRef<number | null>(null);
   const scheduledFrameRef = useRef<number | null>(null);
 
   const filterValues = useMemo(
@@ -446,29 +445,30 @@ function RetouchApp() {
   );
 
   const updateTargetImage = useCallback(() => {
-    const img = findLargestVisibleImage();
+    const previewButtonPosition = getRetouchButtonPosition();
 
-    if (!img) {
+    if (!previewButtonPosition) {
       if (imageSrcRef.current && imageRectRef.current) {
-        const now = performance.now();
-        missingTargetSinceRef.current ??= now;
-
-        if (
-          getRetouchButtonPosition() ||
-          now - missingTargetSinceRef.current < 1_000
-        ) {
-          return;
-        }
-
         setPanelOpen(false);
+        setRetouchZoom(1);
       }
 
-      missingTargetSinceRef.current = null;
+      setRetouchButtonPosition(null);
       publishTarget(null, null, null);
       return;
     }
 
-    missingTargetSinceRef.current = null;
+    const img = findLargestVisibleImage();
+
+    if (!img) {
+      if (imageSrcRef.current && imageRectRef.current) {
+        return;
+      }
+
+      publishTarget(null, null, null);
+      return;
+    }
+
     publishTarget(img, img.currentSrc, getImageRect(img));
   }, [publishTarget]);
 
@@ -606,21 +606,18 @@ function RetouchApp() {
   const updateRetouchZoom = (nextZoom: number) => {
     setRetouchZoom(clamp(round(nextZoom), 0.25, 4));
   };
-  const hasImageTarget = Boolean(imageSrc && imageRect);
+  const previewTargetPosition =
+    imageSrc && imageRect ? retouchButtonPosition : null;
 
   return (
     <>
-      {hasImageTarget && !panelOpen && (
+      {previewTargetPosition && !panelOpen && (
         <button
           className="dr-retouch-launcher"
-          style={
-            retouchButtonPosition
-              ? {
-                  left: retouchButtonPosition.left,
-                  top: retouchButtonPosition.top,
-                }
-              : undefined
-          }
+          style={{
+            left: previewTargetPosition.left,
+            top: previewTargetPosition.top,
+          }}
           title="Drive Retouchを開く"
           onClick={() => setPanelOpen(true)}
         >
